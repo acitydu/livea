@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>System Monitor Prototype</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, sans-serif;
+            background: #f0f0f0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            gap: 40px;
+            padding: 40px;
+        }
+
+        .demo-label {
+            font-size: 14px;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: -20px;
+        }
+
+        /* ========== 模拟Win11任务栏 ========== */
+        .taskbar {
+            width: 100%;
+            max-width: 1200px;
+            height: 48px;
+            background: rgba(243, 243, 243, 0.85);
+            backdrop-filter: blur(20px) saturate(125%);
+            -webkit-backdrop-filter: blur(20px) saturate(125%);
+            border-top: 1px solid rgba(255, 255, 255, 0.6);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            padding: 0 16px;
+            gap: 8px;
+            box-shadow: 0 -1px 3px rgba(0,0,0,0.05), 0 4px 20px rgba(0,0,0,0.08);
+            position: relative;
+        }
+
+        /* 开始按钮 */
+        .start-btn {
+            width: 36px;
+            height: 36px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 6px;
+            transition: background 0.15s;
+        }
+        .start-btn:hover {
+            background: rgba(0,0,0,0.05);
+        }
+        .start-btn svg {
+            width: 20px;
+            height: 20px;
+        }
+
+        /* 搜索 */
+        .search-box {
+            width: 200px;
+            height: 32px;
+            background: rgba(255,255,255,0.7);
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            padding: 0 12px;
+            gap: 8px;
+            font-size: 13px;
+            color: #5f5f5f;
+            border: 1px solid rgba(0,0,0,0.04);
+        }
+
+        /* 任务视图 */
+        .taskview {
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 6px;
+            transition: background 0.15s;
+        }
+        .taskview:hover {
+            background: rgba(0,0,0,0.05);
+        }
+
+        /* 应用图标区域 */
+        .apps-area {
+            display: flex;
+            gap: 4px;
+            flex: 1;
+            justify-content: center;
+        }
+
+        .app-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.15s;
+            position: relative;
+        }
+        .app-icon:hover {
+            background: rgba(0,0,0,0.05);
+        }
+        .app-icon.active::after {
+            content: '';
+            position: absolute;
+            bottom: 4px;
+            width: 16px;
+            height: 3px;
+            background: #c42b1c;
+            border-radius: 2px;
+        }
+
+        /* ========== 核心：伪装指数显示 ========== */
+        .index-monitor {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 0 12px;
+            height: 36px;
+            border-radius: 6px;
+            transition: background 0.15s;
+            cursor: default;
+            position: relative;
+        }
+        .index-monitor:hover {
+            background: rgba(0,0,0,0.04);
+        }
+
+        .index-item {
+            display: flex;
+            align-items: baseline;
+            gap: 6px;
+            font-size: 12px;
+            line-height: 1;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .index-code {
+            font-size: 11px;
+            color: #6b7280;
+            font-weight: 500;
+            letter-spacing: 0.3px;
+        }
+
+        .index-value {
+            font-size: 12px;
+            color: #1f2937;
+            font-weight: 600;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .index-points {
+            font-size: 11px;
+            color: #4b5563;
+            font-weight: 500;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .index-percent {
+            font-size: 11px;
+            color: #6b7280;
+            font-weight: 400;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* ========== 系统托盘区域 ========== */
+        .tray-area {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding-left: 8px;
+            border-left: 1px solid rgba(0,0,0,0.06);
+        }
+
+        .tray-icon {
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 6px;
+            transition: background 0.15s;
+        }
+        .tray-icon:hover {
+            background: rgba(0,0,0,0.05);
+        }
+
+        .time-display {
+            font-size: 12px;
+            color: #1f2937;
+            font-weight: 500;
+            padding: 0 4px;
+            text-align: center;
+            line-height: 1.3;
+        }
+
+        /* ========== Tooltip ========== */
+        .tooltip {
+            position: absolute;
+            bottom: 56px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(0,0,0,0.08);
+            border-radius: 8px;
+            padding: 12px 16px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.12);
+            font-size: 12px;
+            white-space: nowrap;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s, transform 0.2s;
+            z-index: 100;
+        }
+
+        .index-monitor:hover .tooltip {
+            opacity: 1;
+            transform: translateX(-50%) translateY(0);
+        }
+
+        .tooltip-row {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+            padding: 3px 0;
+        }
+
+        .tooltip-name {
+            width: 70px;
+            color: #6b7280;
+            font-size: 11px;
+        }
+
+        .tooltip-value {
+            width: 60px;
+            text-align: right;
+            font-weight: 600;
+            color: #1f2937;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .tooltip-change {
+            width: 70px;
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* ========== 说明 ========== */
+        .note {
+            font-size: 12px;
+            color: #6b7280;
+            max-width: 600px;
+            text-align: center;
+            line-height: 1.6;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="note" style="margin-bottom: 20px;">
+        <strong>Win11 浅色模式任务栏伪装原型 - 方案一（完整数据）</strong><br>
+        显示代码 + 点数 + 涨跌点数 + 涨跌幅，全部灰度无色彩。<br>
+        鼠标悬停查看详细中文名称。
+    </div>
+
+    <!-- ========== 方案1: 标准融合（完整版） ========== -->
+    <div class="demo-label">方案一：标准融合（完整数据）</div>
+    <div class="taskbar">
+        <!-- 开始 -->
+        <div class="start-btn">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M3 3h7v7H3V3zm0 11h7v7H3v-7zm11-11h7v7h-7V3zm0 11h7v7h-7v-7z" fill="#1f2937"/></svg>
+        </div>
+        <!-- 搜索 -->
+        <div class="search-box">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#5f5f5f" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+            搜索
+        </div>
+        <!-- 任务视图 -->
+        <div class="taskview">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><rect x="3" y="3" width="7" height="7" rx="1" fill="#1f2937"/><rect x="14" y="3" width="7" height="7" rx="1" fill="#1f2937"/><rect x="3" y="14" width="7" height="7" rx="1" fill="#1f2937"/><rect x="14" y="14" width="7" height="7" rx="1" fill="#1f2937"/></svg>
+        </div>
+        <!-- 应用 -->
+        <div class="apps-area">
+            <div class="app-icon active">
+                <svg width="24" height="24" viewBox="0 0 24 24"><rect width="24" height="24" rx="4" fill="#0078d4"/><path d="M7 12h10M12 7v10" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>
+            </div>
+            <div class="app-icon">
+                <svg width="24" height="24" viewBox="0 0 24 24"><rect width="24" height="24" rx="4" fill="#217346"/><path d="M7 7h4v4H7zM13 7h4v4h-4zM7 13h4v4H7zM13 13h4v4h-4z" fill="white"/></svg>
+            </div>
+            <div class="app-icon">
+                <svg width="24" height="24" viewBox="0 0 24 24"><rect width="24" height="24" rx="4" fill="#d83b01"/><path d="M7 12h10M12 7v10" stroke="white" stroke-width="2" stroke-linecap="round"/></svg>
+            </div>
+            <div class="app-icon">
+                <svg width="24" height="24" viewBox="0 0 24 24"><rect width="24" height="24" rx="4" fill="#f4f4f4" stroke="#d1d1d1" stroke-width="1"/><text x="12" y="16" text-anchor="middle" font-size="10" fill="#666">Edge</text></svg>
+            </div>
+        </div>
+        <!-- 核心：指数显示 -->
+        <div class="index-monitor">
+            <div class="index-item">
+                <span class="index-code">SH</span>
+                <span class="index-value">3387.12</span>
+                <span class="index-points">+7.82</span>
+                <span class="index-percent">+0.23%</span>
+            </div>
+            <div class="index-item">
+                <span class="index-code">SZ</span>
+                <span class="index-value">11245.80</span>
+                <span class="index-points">-16.87</span>
+                <span class="index-percent">-0.15%</span>
+            </div>
+            <div class="index-item">
+                <span class="index-code">CY</span>
+                <span class="index-value">2245.67</span>
+                <span class="index-points">+1.80</span>
+                <span class="index-percent">+0.08%</span>
+            </div>
+            <!-- Tooltip -->
+            <div class="tooltip">
+                <div class="tooltip-row">
+                    <span class="tooltip-name">上证指数</span>
+                    <span class="tooltip-value">3387.12</span>
+                    <span class="tooltip-change">+7.82 +0.23%</span>
+                </div>
+                <div class="tooltip-row">
+                    <span class="tooltip-name">深证成指</span>
+                    <span class="tooltip-value">11245.80</span>
+                    <span class="tooltip-change">-16.87 -0.15%</span>
+                </div>
+                <div class="tooltip-row">
+                    <span class="tooltip-name">创业板指</span>
+                    <span class="tooltip-value">2245.67</span>
+                    <span class="tooltip-change">+1.80 +0.08%</span>
+                </div>
+                <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(0,0,0,0.06); font-size: 11px; color: #9ca3af; text-align: center;">
+                    上次更新: 14:32:18
+                </div>
+            </div>
+        </div>
+        <!-- 系统托盘 -->
+        <div class="tray-area">
+            <div class="tray-icon">^</div>
+            <div class="tray-icon">📶</div>
+            <div class="tray-icon">🔊</div>
+            <div class="time-display">
+                14:32<br><span style="font-size: 11px;">2025/5/6</span>
+            </div>
+            <div class="tray-icon">
+                <svg width="16" height="16" viewBox="0 0 24 24"><path d="M12 15l-4-4h8l-4 4z" fill="#1f2937"/></svg>
+            </div>
+        </div>
+    </div>
+
+    <div class="note" style="margin-top: 20px;">
+        <strong>设计说明：</strong><br>
+        1. 显示格式：代码 + 当前点数 + 涨跌点数 + 涨跌幅百分比<br>
+        2. 示例：SH 3387.12 +7.82 +0.23%<br>
+        3. 全部灰度，无红绿色，涨跌通过 +/- 符号区分<br>
+        4. 两字母代码：SH=上证, SZ=深证, CY=创业, KC=科创, HS=沪深300, ZZ=中证500<br>
+        5. 鼠标悬停显示完整中文名称和更新时间
+    </div>
+
+</body>
+</html>
