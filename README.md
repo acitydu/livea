@@ -38,7 +38,7 @@ system-monitor-prototype/
 pip install PyQt6
 
 # 运行程序
-cd E:\hermes_space\system-monitor-prototype
+cd <your-install-path>
 python src\main.py
 ```
 

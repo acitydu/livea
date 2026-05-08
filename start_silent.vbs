@@ -1,3 +1,4 @@
+' Get the directory where the VBS script is located
 Set oShell = CreateObject("WScript.Shell")
-oShell.CurrentDirectory = "E:\hermes_space\system-monitor-prototype"
+oShell.CurrentDirectory = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName)
 oShell.Run "start_silent_inner.bat", 0, False
