@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+logs/
+config/*.json
+config/*.bak
+config/*.tmp
+.test-tmp/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/

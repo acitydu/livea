@@ -6,8 +6,13 @@ Displays real-time data in a taskbar-integrated format.
 import sys
 import json
 import os
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
+
+from turnover import (MARKET_CODES, COMPARE_INTERVALS, YUAN_PER_YI,
+                      TurnoverService, amount, format_yi)
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout,
@@ -32,6 +37,7 @@ CONFIG_FILE = Path(__file__).parent.parent / "config" / "settings.json"
 DEFAULT_CONFIG = {
     "indices": ["sh000001", "sz399001", "sz399006", "sh000300", "sh000016", "sh000852"],
     "refresh_interval": 10,
+    "turnover_compare_minutes": 1,
     "display_format": "full",
     "position": "taskbar_center_right",
     "hotkey": "`",
@@ -41,10 +47,7 @@ DEFAULT_CONFIG = {
     "show_on_hover": True,
 }
 
-# 昨日成交量缓存（亿元）
-PREV_VOLUME_FILE = Path(__file__).parent.parent / "config" / "prev_volume.json"
-
-# 分时成交额缓存（用于昨天此刻对比）
+# 按交易日保存的分时成交额缓存（金额单位：元）
 MINUTE_CACHE_FILE = Path(__file__).parent.parent / "config" / "minute_cache.json"
 
 INDEX_NAMES = {
@@ -61,132 +64,78 @@ INDEX_NAMES = {
 
 
 class DataFetcher(QThread):
-    """后台线程获取数据"""
+    """后台获取指数，同时始终获取沪深成交额和行情时间。"""
     data_ready = pyqtSignal(dict)
-    history_ready = pyqtSignal(dict)  # 历史成交量
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, indices, fetch_history=False):
+    def __init__(self, indices):
         super().__init__()
-        self.indices = indices
-        self._running = True
-        self.fetch_history = fetch_history
+        self.indices = list(dict.fromkeys([*indices, *MARKET_CODES]))
 
     def run(self):
         import urllib.request
-        import urllib.error
-
-        # 腾讯行情API（比新浪更稳定）
-        # URL: http://qt.gtimg.cn/?q=s_sh000001,s_sz399001
-        # 简版格式: v_s_code="flag~name~code~current~change~change%~volume~amount~..."
-        # [3]=current, [4]=change, [5]=change%, [6]=volume(股), [7]=amount(万元)
-        codes_param = ",".join([f"s_{c}" for c in self.indices])
-        url = f"http://qt.gtimg.cn/?q={codes_param}"
-
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://finance.qq.com'
-        }
-
+        # 保持现有指数简版行情；两市完整版提供金额精度和交易日期。
+        codes = [f"s_{c}" for c in self.indices] + list(MARKET_CODES)
+        url = "https://qt.gtimg.cn/?q=" + ",".join(codes)
         try:
-            req = urllib.request.Request(url, headers=headers)
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0", "Referer": "https://finance.qq.com"
+            })
             with urllib.request.urlopen(req, timeout=10) as response:
-                data = response.read().decode('gbk')
-
+                raw = response.read().decode("gbk", errors="replace")
             result = {}
-            for line in data.strip().split('\n'):
-                if not line.strip():
+            full_quotes = {}
+            for line in raw.splitlines():
+                if "=" not in line:
                     continue
-                # 解析 v_s_sh000001="1~name~code~current~close~open~volume~...";
-                # 格式: v_s_code（腾讯格式）
-                if '=' in line:
-                    code_part = line.split('=')[0]  # e.g. v_s_sh000001
-                    parts_code = code_part.split('_')  # ['v', 's', 'sh000001']
-                    raw_code = parts_code[-1] if len(parts_code) >= 3 else code_part  # sh000001
-                    if raw_code in self.indices:
-                        value_part = line.split('=')[1].strip().strip('";')
-                        parts = value_part.split('~')
-                        if len(parts) >= 8:
-                            name = parts[1]
-                            current = float(parts[3]) if parts[3] else 0
-                            change = float(parts[4]) if parts[4] else 0  # 涨跌额
-                            change_pct = float(parts[5]) if parts[5] else 0  # 涨跌幅
-                            prev_close = current - change  # 昨收 = 当前价 - 涨跌额
-                            # 简版格式: [3]=current, [4]=change, [5]=change%, [6]=volume(股), [7]=amount(万元)
-                            vol = float(parts[6]) if len(parts) > 6 and parts[6] else 0  # 成交量(股)
-                            amount_wan = float(parts[7]) if len(parts) > 7 and parts[7] else 0  # 成交额(万元)
-                            amount_yi = amount_wan / 10000  # 转换为亿元
+                key, value = line.split("=", 1)
+                fields = value.strip().strip(';"').split("~")
+                if key.startswith("v_s_") and len(fields) >= 8:
+                    code = key[4:]
+                    current, change = float(fields[3]), float(fields[4])
+                    result[code] = {
+                        "name": fields[1], "current": current,
+                        "prev_close": current - change, "change": change,
+                        "change_pct": float(fields[5]),
+                    }
+                elif key[2:] in MARKET_CODES and len(fields) > 37:
+                    full_quotes[key[2:]] = fields
+            for code, fields in full_quotes.items():
+                if code in result:
+                    try:
+                        result[code]["timestamp"] = datetime.strptime(fields[30], "%Y%m%d%H%M%S")
+                        result[code]["amount_yuan"] = amount(fields[35].split("/")[2])
+                    except (ValueError, IndexError):
+                        logging.warning("%s 完整版成交额不可用", code)
+            if not result:
+                raise ValueError("行情接口未返回有效指数")
+            if not self.isInterruptionRequested():
+                self.data_ready.emit(result)
+        except Exception as exc:
+            logging.exception("获取行情失败")
+            if not self.isInterruptionRequested():
+                self.error_occurred.emit(str(exc))
 
-                            result[raw_code] = {
-                                'name': name,
-                                'current': current,
-                                'prev_close': prev_close,
-                                'change': change,
-                                'change_pct': change_pct,
-                                'volume': vol,
-                                'amount_yi': amount_yi,
-                            }
 
-            self.data_ready.emit(result)
+class TurnoverFetcher(QThread):
+    data_ready = pyqtSignal(object)
+    error_occurred = pyqtSignal(str)
 
-            # 获取历史成交量（仅上证和深证）
-            if self.fetch_history:
-                history = self.fetch_history_data()
-                if history:
-                    self.history_ready.emit(history)
+    def __init__(self, service):
+        super().__init__()
+        self.service = service
 
-        except Exception as e:
-            import traceback
-            print(f"[ERROR] Fetch failed: {e}")
-            traceback.print_exc()
-            self.error_occurred.emit(str(e))
-
-    def fetch_history_data(self):
-        """从腾讯K线API获取最近非今日的成交额（亿元）"""
-        import urllib.request
-        import json
-        from datetime import datetime
-
-        history = {}
-        today = datetime.now().strftime('%Y-%m-%d')
-
-        # 只获取上证和深证的历史数据
-        for code in ['sh000001', 'sz399001']:
-            if code not in self.indices:
-                continue
-
-            try:
-                # 腾讯日K线API
-                url = f"https://web.ifzq.gtimg.cn/appstock/app/kline/getKlineData?param={code},daily,,,5,qfq"
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Referer': 'https://finance.qq.com'
-                }
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    data = json.loads(response.read().decode('utf-8'))
-
-                # 解析腾讯K线数据: data[data][qmqj][data] = [[date, open, close, high, low, volume, amount, ...], ...]
-                qmqj = data.get('data', {}).get(code, {}).get('data', {})
-                klines = qmqj.get('data', []) if isinstance(qmqj, dict) else (qmqj or [])
-
-                # 找最近一个非今日且有成交额的数据
-                for kline in klines:
-                    if len(kline) >= 7:
-                        date_str = kline[0]  # YYYY-MM-DD
-                        amount = float(kline[6]) if kline[6] else 0  # 成交额(万元)
-                        if date_str != today and amount > 0:
-                            amount_yi = amount / 10000  # 万元转亿元
-                            history[code] = amount_yi
-                            break
-            except Exception:
-                pass
-
-        return history
-
-    def stop(self):
-        self._running = False
-        self.wait(1000)
+    def run(self):
+        try:
+            comparison = self.service.refresh(self.isInterruptionRequested)
+            if not self.isInterruptionRequested():
+                self.data_ready.emit(comparison)
+        except InterruptedError:
+            pass
+        except Exception as exc:
+            logging.warning("成交额对比暂不可用：%s", exc)
+            if not self.isInterruptionRequested():
+                self.error_occurred.emit(str(exc))
 
 
 class SettingsDialog(QDialog):
@@ -195,7 +144,8 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.config = config.copy()
         self.setWindowTitle("显示设置")
-        self.setFixedSize(380, 480)
+        self.resize(400, 560)
+        self.setMinimumWidth(380)
         self.setStyleSheet("""
             QDialog {
                 background: rgba(255, 255, 255, 0.95);
@@ -322,6 +272,14 @@ class SettingsDialog(QDialog):
         self.hotkey_combo.setCurrentIndex(idx)
         basic_layout.addWidget(self.hotkey_combo, 1, 1)
 
+        basic_layout.addWidget(QLabel("成交额对比间隔:"), 2, 0)
+        self.compare_combo = QComboBox()
+        for minutes in COMPARE_INTERVALS:
+            self.compare_combo.addItem(f"{minutes} 分钟", minutes)
+        self.compare_combo.setCurrentIndex(max(0, self.compare_combo.findData(
+            self.config.get('turnover_compare_minutes', 1))))
+        basic_layout.addWidget(self.compare_combo, 2, 1)
+
         layout.addWidget(basic_group)
 
         # 指数选择
@@ -368,10 +326,12 @@ class SettingsDialog(QDialog):
 
     def save_settings(self):
         self.config['refresh_interval'] = self.interval_spin.value()
+        self.config['turnover_compare_minutes'] = self.compare_combo.currentData()
         self.config['hotkey'] = self.hotkey_combo.currentText()
-        self.config['indices'] = [
-            code for code, cb in self.index_checkboxes.items() if cb.isChecked()
-        ]
+        selected = [code for code, cb in self.index_checkboxes.items() if cb.isChecked()]
+        # 修改对比间隔时保留用户已有的指数顺序。
+        original = [code for code in self.config.get('indices', []) if code in selected]
+        self.config['indices'] = original + [code for code in selected if code not in original]
         self.accept()
 
     def get_config(self):
@@ -390,6 +350,12 @@ class MainWindow(QWidget):
         # 数据
         self.index_data = {}
         self.fetcher = None
+        self.turnover_fetcher = None
+        self.turnover_service = TurnoverService(MINUTE_CACHE_FILE)
+        self.comparison = None
+        self.comparison_error = "正在获取分时数据"
+        self.quote_error = ""
+        self._closing = False
 
         # 隐藏状态
         self.is_hidden = False
@@ -398,7 +364,8 @@ class MainWindow(QWidget):
         self.init_timer()
         self.init_tray()
         self.init_hotkey()
-        self.fetch_data(fetch_history=True)  # 首次获取历史成交量
+        self.fetch_data()
+        self.fetch_turnover()
 
     def paintEvent(self, event):
         """绘制完全透明背景"""
@@ -474,8 +441,8 @@ class MainWindow(QWidget):
         """创建指数显示组件 - 两行HBoxLayout"""
         # 清除旧组件
         for layout in [self.row1_layout, self.row2_layout]:
-            for i in reversed(range(layout.count())):
-                item = layout.itemAt(i)
+            while layout.count():
+                item = layout.takeAt(0)
                 if item.widget():
                     item.widget().deleteLater()
 
@@ -505,6 +472,7 @@ class MainWindow(QWidget):
         self.row2_layout.addWidget(indices_container)
         self.row2_layout.addStretch()
         vol_container = QWidget()
+        self.volume_container = vol_container
         vol_container.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         vol_inner = QHBoxLayout(vol_container)
         vol_inner.setContentsMargins(0, 0, 0, 0)
@@ -522,7 +490,7 @@ class MainWindow(QWidget):
         self.vol_total.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         vol_inner.addWidget(self.vol_total)
 
-        self.vol_diff = QLabel("")
+        self.vol_diff = QLabel(" --")
         self.vol_diff.setFont(self.font_volume)
         self.vol_diff.setStyleSheet("color: #6b7280;")
         self.vol_diff.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
@@ -532,7 +500,8 @@ class MainWindow(QWidget):
         self.status_label.setFont(self.font_volume)
         self.status_label.setStyleSheet("color: #6b7280;")
         self.status_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.status_label.setFixedWidth(12)
+        self.status_label.setFixedWidth(24)
+        self.status_label.setContentsMargins(4, 0, 0, 0)
         vol_inner.addWidget(self.status_label)
 
         self.row2_layout.addWidget(vol_container)
@@ -595,13 +564,16 @@ class MainWindow(QWidget):
 
         self.move(x, y)
 
-        print(f"[DEBUG] Window position: x={x}, y={y}, size={self.width()}x{self.height()}, Screen: {screen_geo.width()}x{screen_geo.height()}")
+        logging.debug("Window position: x=%s, y=%s", x, y)
 
     def init_timer(self):
         """初始化定时器"""
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.fetch_data)
         self.timer.start(self.config.get('refresh_interval', 30) * 1000)
+        self.turnover_timer = QTimer(self)
+        self.turnover_timer.timeout.connect(self.fetch_turnover)
+        self.turnover_timer.start(self.config['turnover_compare_minutes'] * 60000)
 
     def init_tray(self):
         """初始化系统托盘"""
@@ -688,36 +660,44 @@ class MainWindow(QWidget):
 
         shortcut.activated.connect(self.toggle_visibility)
 
-    def fetch_data(self, fetch_history=False):
-        """获取数据"""
-        print("[DEBUG] Fetching data...")
-        if self.fetcher and self.fetcher.isRunning():
-            print("[DEBUG] Fetcher already running, skip")
+    def fetch_data(self):
+        if self._closing or (self.fetcher and self.fetcher.isRunning()):
             return
-
-        self.fetcher = DataFetcher(self.config.get('indices', []), fetch_history=fetch_history)
+        if self.fetcher:
+            self.fetcher.deleteLater()
+        self.fetcher = DataFetcher(self.config.get('indices', []))
         self.fetcher.data_ready.connect(self.update_display)
-        self.fetcher.history_ready.connect(self.update_history)
         self.fetcher.error_occurred.connect(self.handle_error)
+        self.fetcher.finished.connect(self.finish_quit)
         self.fetcher.start()
-        print("[DEBUG] Fetcher started")
 
-    def update_history(self, history):
-        """更新历史成交额"""
-        print(f"[DEBUG] History data: {history}")
-        # 计算总成交额并保存到_total
-        if 'sh000001' in history and 'sz399001' in history:
-            total_yi = history['sh000001'] + history['sz399001']
-            self.save_prev_volume('_total', total_yi)
-            print(f"[DEBUG] Saved _total prev amount: {total_yi:.2f}亿")
-        elif 'sh000001' in history:
-            self.save_prev_volume('_total', history['sh000001'])
-        elif 'sz399001' in history:
-            self.save_prev_volume('_total', history['sz399001'])
+    def fetch_turnover(self):
+        if self._closing or (self.turnover_fetcher and self.turnover_fetcher.isRunning()):
+            return
+        if self.turnover_fetcher:
+            self.turnover_fetcher.deleteLater()
+        self.turnover_fetcher = TurnoverFetcher(self.turnover_service)
+        self.turnover_fetcher.data_ready.connect(self.update_turnover)
+        self.turnover_fetcher.error_occurred.connect(self.handle_turnover_error)
+        self.turnover_fetcher.finished.connect(self.finish_quit)
+        self.turnover_fetcher.start()
+
+    def update_turnover(self, comparison):
+        self.comparison = comparison
+        self.comparison_error = ""
+        self.render_turnover()
+        logging.info("成交额对比 %s/%s %s：%s",
+                     comparison.trading_date, comparison.previous_date,
+                     comparison.minute, format_yi(comparison.difference_yuan, signed=True))
+
+    def handle_turnover_error(self, message):
+        self.comparison = None
+        self.comparison_error = message
+        self.render_turnover()
 
     def update_display(self, data):
         """更新显示"""
-        print(f"[DEBUG] Data received: {len(data)} indices")
+        logging.debug("Data received: %s indices", len(data))
         self.index_data = data
         self.status_label.setText("OK")
         self.status_label.setStyleSheet("color: #6b7280;")
@@ -738,136 +718,55 @@ class MainWindow(QWidget):
                 widgets['value'].setText("--")
                 widgets['change'].setText("--")
 
-        # A股总成交额 = 上证 + 深证成交额（亿元）
-        total_yi = 0
-        if 'sh000001' in data:
-            total_yi += data['sh000001'].get('amount_yi', 0)
-        if 'sz399001' in data:
-            total_yi += data['sz399001'].get('amount_yi', 0)
+        self.quote_error = ""
+        self.render_turnover()
 
-        self.vol_total.setText(f"{int(total_yi)}亿")
+    def render_turnover(self):
+        tooltip = ["沪深合计成交额（不含北交所）"]
+        quote_date = None
+        try:
+            markets = [self.index_data[c] for c in MARKET_CODES]
+            timestamps = [m["timestamp"] for m in markets]
+            if len({t.date() for t in timestamps}) != 1 or self.quote_error:
+                raise ValueError("两市行情不完整")
+            total = sum(m["amount_yuan"] for m in markets)
+            quote_date = timestamps[0].strftime("%Y%m%d")
+            self.vol_total.setText(format_yi(total))
+            tooltip.append(f"实时总额：{total / YUAN_PER_YI:,.2f} 亿")
+            tooltip.append("行情时间：" + min(timestamps).strftime("%Y-%m-%d %H:%M:%S"))
+        except (KeyError, ValueError):
+            self.vol_total.setText("--")
+            tooltip.append("实时总额暂不可用：" + (self.quote_error or "等待沪深两市完整行情"))
 
-        # 计算与昨天同一时刻的差值
-        prev_amount = self.get_yesterday_amount_at_same_time()
-        
-        if prev_amount > 0:
-            diff = total_yi - prev_amount
-            diff_sign = '+' if diff >= 0 else ''
-            self.vol_diff.setText(f" {diff_sign}{int(diff)}")
+        comparison = self.comparison
+        if comparison and comparison.trading_date == quote_date:
+            self.vol_diff.setText(" " + format_yi(comparison.difference_yuan, signed=True))
+            minute = comparison.minute[:2] + ":" + comparison.minute[2:]
+            today = datetime.strptime(comparison.trading_date, "%Y%m%d").strftime("%Y-%m-%d")
+            previous = datetime.strptime(comparison.previous_date, "%Y%m%d").strftime("%Y-%m-%d")
+            tooltip.extend([
+                f"较上一交易日同刻（截至 {minute}）：",
+                f"{today}：{comparison.current_yuan / YUAN_PER_YI:,.2f} 亿",
+                f"{previous}：{comparison.previous_yuan / YUAN_PER_YI:,.2f} 亿",
+                f"差额：{comparison.difference_yuan / YUAN_PER_YI:+,.2f} 亿",
+            ])
         else:
-            self.vol_diff.setText("")
-
-        # 保存当前时刻的累计成交额到缓存（用于明天对比）
-        now = datetime.now()
-        if 9 <= now.hour < 16:  # 交易时间内
-            cache = self.load_minute_cache()
-            if 'amounts' not in cache:
-                cache['amounts'] = {}
-            cache['amounts'][now.strftime('%H:%M')] = total_yi
-            self.save_minute_cache(cache)
-
-    def load_prev_volume(self):
-        """加载昨日成交量缓存（兼容旧版）"""
-        try:
-            if PREV_VOLUME_FILE.exists():
-                with open(PREV_VOLUME_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception:
-            pass
-        return {}
-
-    def save_prev_volume(self, code, amount_yi):
-        """保存成交量到缓存（兼容旧版）"""
-        try:
-            PREV_VOLUME_FILE.parent.mkdir(parents=True, exist_ok=True)
-            data = self.load_prev_volume()
-            data[code] = amount_yi
-            with open(PREV_VOLUME_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    def load_amount_history(self):
-        """加载历史成交额缓存（按时间点）"""
-        try:
-            if AMOUNT_HISTORY_FILE.exists():
-                with open(AMOUNT_HISTORY_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception:
-            pass
-        return {}
-
-    def save_amount_history(self, history):
-        """保存历史成交额缓存"""
-        try:
-            AMOUNT_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(AMOUNT_HISTORY_FILE, 'w', encoding='utf-8') as f:
-                json.dump(history, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    def get_yesterday_amount_at_same_time(self):
-        """获取昨天同一时刻的累计成交额（亿元）"""
-        try:
-            from datetime import datetime, timedelta
-            
-            now = datetime.now()
-            time_key = now.strftime('%H:%M')  # 如 "14:30"
-            
-            # 加载昨天的分时缓存
-            cache = self.load_minute_cache()
-            
-            # 找昨天同一时刻或最接近的数据
-            if 'amounts' in cache:
-                amounts = cache['amounts']
-                # 找最接近当前时间的数据点
-                closest_amount = 0
-                closest_diff = 999999
-                
-                for time_str, amount in amounts.items():
-                    # time_str 格式 "HH:MM"
-                    h, m = map(int, time_str.split(':'))
-                    curr_h, curr_m = now.hour, now.minute
-                    diff = abs((curr_h * 60 + curr_m) - (h * 60 + m))
-                    if diff < closest_diff:
-                        closest_diff = diff
-                        closest_amount = amount
-                
-                return closest_amount
-            
-            return 0
-        except Exception as e:
-            print(f"[DEBUG] get_yesterday_amount error: {e}")
-            return 0
-    
-    def load_minute_cache(self):
-        """加载上一交易日的分时成交额缓存"""
-        try:
-            if MINUTE_CACHE_FILE.exists():
-                with open(MINUTE_CACHE_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception:
-            pass
-        return {}
-    
-    def save_minute_cache(self, amounts):
-        """保存分时成交额缓存"""
-        try:
-            MINUTE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            cache = {
-                'date': datetime.now().strftime('%Y-%m-%d'),
-                'amounts': amounts
-            }
-            with open(MINUTE_CACHE_FILE, 'w', encoding='utf-8') as f:
-                json.dump(cache, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+            self.vol_diff.setText(" --")
+            tooltip.append("较昨同刻暂不可用：" + (self.comparison_error or "等待同一交易日完整数据"))
+        tooltip.append(f"差额每 {self.config['turnover_compare_minutes']} 分钟更新，使用已完成分钟")
+        self.volume_container.setToolTip("\n".join(tooltip))
+        # 保留两行布局，成交额变长时扩展窗口，避免金额或指数被截断。
+        self.main_layout.invalidate()
+        width = max(450, self.main_layout.sizeHint().width(), self.width())
+        self.setFixedWidth(width)
 
     def handle_error(self, error_msg):
         """处理错误"""
-        print(f"数据获取错误: {error_msg}")
+        logging.warning("行情显示暂不可用：%s", error_msg)
         self.status_label.setText("ERR")
         self.status_label.setStyleSheet("color: #ef4444;")
+        self.quote_error = error_msg
+        self.render_turnover()
         # 显示最后已知数据或保持原样
 
     def toggle_visibility(self):
@@ -912,9 +811,12 @@ class MainWindow(QWidget):
             # 重启定时器
             self.timer.stop()
             self.timer.start(self.config.get('refresh_interval', 30) * 1000)
+            self.turnover_timer.start(self.config['turnover_compare_minutes'] * 60000)
 
             # 重新获取数据
             self.fetch_data()
+            self.render_turnover()
+            self.fetch_turnover()
 
     def tray_activated(self, reason):
         """托盘图标激活"""
@@ -951,7 +853,7 @@ class MainWindow(QWidget):
                 # 拖拽结束，保存位置到配置
                 self.config['window_pos'] = [self.x(), self.y()]
                 self.save_config()
-                print(f"[DEBUG] Position saved: {self.x()}, {self.y()}")
+                logging.debug("Position saved: %s, %s", self.x(), self.y())
 
     def enterEvent(self, event):
         """鼠标进入 - 显示tooltip效果"""
@@ -967,7 +869,10 @@ class MainWindow(QWidget):
         try:
             if CONFIG_FILE.exists():
                 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    return {**DEFAULT_CONFIG, **json.load(f)}
+                    config = {**DEFAULT_CONFIG, **json.load(f)}
+                    if config['turnover_compare_minutes'] not in COMPARE_INTERVALS:
+                        config['turnover_compare_minutes'] = 1
+                    return config
         except Exception:
             pass
         return DEFAULT_CONFIG.copy()
@@ -979,14 +884,26 @@ class MainWindow(QWidget):
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"保存配置失败: {e}")
+            logging.exception("保存配置失败")
 
     def quit_app(self):
         """退出应用"""
-        if self.fetcher and self.fetcher.isRunning():
-            self.fetcher.stop()
+        self._closing = True
+        self.timer.stop()
+        self.turnover_timer.stop()
+        self.hide()
         self.tray.hide()
-        QApplication.quit()
+        for worker in (self.fetcher, self.turnover_fetcher):
+            if worker and worker.isRunning():
+                worker.requestInterruption()
+        self.finish_quit()
+
+    def finish_quit(self):
+        if self._closing and not any(
+            worker and worker.isRunning() for worker in (self.fetcher, self.turnover_fetcher)
+        ):
+            logging.info("应用正常退出")
+            QApplication.quit()
 
     def paintEvent(self, event):
         """绘制背景 - 模拟任务栏风格"""
@@ -1063,6 +980,17 @@ _instance_lock = None
 
 def main():
     global _instance_lock
+
+    log_dir = Path(__file__).parent.parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handlers = [RotatingFileHandler(log_dir / "app.log", maxBytes=1_000_000,
+                                   backupCount=2, encoding="utf-8")]
+    if sys.stderr is not None and sys.stderr.isatty():
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(level=logging.INFO, handlers=handlers,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    sys.excepthook = lambda kind, value, tb: logging.critical(
+        "未处理异常", exc_info=(kind, value, tb))
     
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -1071,9 +999,13 @@ def main():
     lock_file = Path.home() / ".system-monitor" / "instance.lock"
     lock_file.parent.mkdir(parents=True, exist_ok=True)
     try:
-        _instance_lock = open(lock_file, 'w')
+        _instance_lock = open(lock_file, 'a+b')
+        _instance_lock.seek(0)
         msvcrt.locking(_instance_lock.fileno(), msvcrt.LK_NBLCK, 1)
-        _instance_lock.write(str(os.getpid()))
+        _instance_lock.seek(0)
+        _instance_lock.truncate()
+        _instance_lock.write(str(os.getpid()).encode('ascii'))
+        _instance_lock.flush()
     except (IOError, OSError):
         QMessageBox.warning(None, "System Monitor", "程序已在运行中。")
         sys.exit(0)
@@ -1084,6 +1016,8 @@ def main():
 
     window = MainWindow()
     window.show()
+    logging.info("应用启动：pid=%s，成交额对比间隔=%s 分钟", os.getpid(),
+                 window.config['turnover_compare_minutes'])
 
     sys.exit(app.exec())
 

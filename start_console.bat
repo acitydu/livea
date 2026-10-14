@@ -22,7 +22,7 @@ REM check PyQt6
 python -c "import PyQt6" >nul 2>&1
 if errorlevel 1 (
     echo Installing PyQt6...
-    pip install PyQt6
+    python -m pip install PyQt6
     if errorlevel 1 (
         echo [ERROR] PyQt6 install failed
         pause
