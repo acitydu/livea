@@ -14,6 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 import main
+from breadth import Breadth
 from turnover import Comparison, MARKET_CODES
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication, QDialog
@@ -135,6 +136,76 @@ class UiTests(unittest.TestCase):
     def test_quote_fetcher_always_requests_both_markets(self):
         fetcher = main.DataFetcher(['sz399006'])
         self.assertTrue(set(MARKET_CODES).issubset(fetcher.indices))
+        fetcher.deleteLater()
+
+    def test_breadth_fits_top_right_without_overlapping_indices(self):
+        self.window.update_display(self.quotes())
+        self.window.update_turnover(self.comparison())
+        self.window.update_breadth(Breadth(1234, 4321, datetime(2026, 10, 26, 10, 20)))
+        self.window.show()
+        self.app.processEvents()
+        self.assertEqual(self.window.breadth_up.text(), 'Z1234')
+        self.assertEqual(self.window.breadth_down.text(), 'D4321')
+        self.assertIn('沪深 A 股', self.window.breadth_container.toolTip())
+        self.assertIn('2026-10-26 10:20:00', self.window.breadth_container.toolTip())
+        last_index = self.window.index_widgets[self.window.config['indices'][2]]['container']
+        self.assertGreater(self.window.breadth_container.x(), last_index.geometry().right())
+        self.assertLessEqual(self.window.breadth_container.geometry().right(),
+                             self.window.row1_container.width())
+        self.assertLessEqual(self.window.breadth_container.x() - last_index.geometry().right(), 9)
+        last_bottom_index = self.window.index_widgets[self.window.config['indices'][-1]]['container']
+        bottom_index_right = last_bottom_index.mapTo(self.window.row2_container,
+                                                    last_bottom_index.rect().topRight()).x()
+        self.assertGreater(self.window.volume_container.x(), bottom_index_right)
+        self.assertLessEqual(self.window.volume_container.x() - bottom_index_right, 9)
+        for label in (self.window.breadth_up, self.window.breadth_down):
+            self.assertGreaterEqual(label.width(), label.sizeHint().width())
+        self.assertEqual(self.window.height(), 38)
+
+    def test_breadth_failure_recovery_and_settings_rebuild(self):
+        self.window.update_display(self.quotes())
+        breadth = Breadth(0, 5200, datetime(2026, 10, 26, 10, 20))
+        self.window.update_breadth(breadth)
+        self.assertEqual(self.window.breadth_up.text(), 'Z0')
+        self.window.handle_breadth_error('offline')
+        self.assertEqual(self.window.breadth_up.text(), 'Z--')
+        self.assertEqual(self.window.breadth_down.text(), 'D--')
+        self.assertIn('offline', self.window.breadth_container.toolTip())
+        self.assertEqual(self.window.vol_total.text(), '400亿')
+        self.assertEqual(self.window.status_label.text(), 'OK')
+        self.window.update_breadth(breadth)
+        self.window.create_index_widgets()
+        self.assertEqual(self.window.breadth_down.text(), 'D5200')
+
+    def test_worker_breadth_failure_preserves_successful_quotes(self):
+        fetcher = main.DataFetcher(['sz399006'])
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = b'v_s_sz399006="51~CY~399006~2600~20~0.78~0~0";'
+        quotes, errors, breadth_errors = [], [], []
+        fetcher.data_ready.connect(quotes.append)
+        fetcher.error_occurred.connect(errors.append)
+        fetcher.breadth_error_occurred.connect(breadth_errors.append)
+        with patch('urllib.request.urlopen', return_value=response), \
+                patch.object(main, 'request_breadth', side_effect=ValueError('missing market')):
+            fetcher.run()
+        self.assertEqual(quotes[0]['sz399006']['current'], 2600)
+        self.assertEqual(errors, [])
+        self.assertEqual(breadth_errors, ['missing market'])
+        fetcher.deleteLater()
+
+    def test_worker_quote_failure_still_updates_breadth(self):
+        fetcher = main.DataFetcher([])
+        breadth = Breadth(1500, 3500, datetime(2026, 10, 26, 10, 20))
+        received, errors = [], []
+        fetcher.breadth_ready.connect(received.append)
+        fetcher.error_occurred.connect(errors.append)
+        with patch('urllib.request.urlopen', side_effect=OSError('offline')), \
+                patch.object(main, 'request_breadth', return_value=breadth):
+            fetcher.run()
+        self.assertEqual(received, [breadth])
+        self.assertEqual(errors, ['offline'])
         fetcher.deleteLater()
 
     def test_quit_waits_for_active_worker_without_destroying_it(self):

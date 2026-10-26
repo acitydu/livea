@@ -13,6 +13,7 @@ from datetime import datetime
 
 from turnover import (MARKET_CODES, COMPARE_INTERVALS, YUAN_PER_YI,
                       TurnoverService, amount, format_yi)
+from breadth import request_breadth
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout,
@@ -64,9 +65,11 @@ INDEX_NAMES = {
 
 
 class DataFetcher(QThread):
-    """后台获取指数，同时始终获取沪深成交额和行情时间。"""
+    """后台获取指数、沪深成交额和 A 股涨跌家数。"""
     data_ready = pyqtSignal(dict)
     error_occurred = pyqtSignal(str)
+    breadth_ready = pyqtSignal(object)
+    breadth_error_occurred = pyqtSignal(str)
 
     def __init__(self, indices):
         super().__init__()
@@ -115,6 +118,18 @@ class DataFetcher(QThread):
             logging.exception("获取行情失败")
             if not self.isInterruptionRequested():
                 self.error_occurred.emit(str(exc))
+
+        # 家数单独报错，避免影响已成功返回的指数和成交额。
+        if self.isInterruptionRequested():
+            return
+        try:
+            breadth = request_breadth()
+            if not self.isInterruptionRequested():
+                self.breadth_ready.emit(breadth)
+        except Exception as exc:
+            logging.warning("涨跌家数暂不可用：%s", exc)
+            if not self.isInterruptionRequested():
+                self.breadth_error_occurred.emit(str(exc))
 
 
 class TurnoverFetcher(QThread):
@@ -355,6 +370,8 @@ class MainWindow(QWidget):
         self.comparison = None
         self.comparison_error = "正在获取分时数据"
         self.quote_error = ""
+        self.breadth = None
+        self.breadth_error = "正在获取涨跌家数"
         self._closing = False
 
         # 隐藏状态
@@ -385,17 +402,17 @@ class MainWindow(QWidget):
         # 设置窗口大小和位置
         self.update_position()
 
-        # 主布局 - 两行：第一行指数，第二行成交量
+        # 主布局 - 两行：第一行指数和涨跌家数，第二行指数和成交额
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(4, 1, 4, 1)
         self.main_layout.setSpacing(0)
-        # 第一行：指数row1（前3个）
+        # 第一行：指数row1（前3个）+ 右侧涨跌家数
         self.row1_container = QWidget()
         self.row1_container.setStyleSheet("background: transparent; border: none;")
-        self.row1_container.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.row1_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.row1_layout = QHBoxLayout(self.row1_container)
         self.row1_layout.setContentsMargins(0, 0, 0, 0)
-        self.row1_layout.setSpacing(16)
+        self.row1_layout.setSpacing(8)
         self.main_layout.addWidget(self.row1_container)
 
         # 第二行：指数row2（后3个）+ 成交额（结构在create_index_widgets里创建）
@@ -403,7 +420,7 @@ class MainWindow(QWidget):
         self.row2_container.setStyleSheet("background: transparent; border: none;")
         self.row2_layout = QHBoxLayout(self.row2_container)
         self.row2_layout.setContentsMargins(0, 0, 0, 0)
-        self.row2_layout.setSpacing(16)
+        self.row2_layout.setSpacing(8)
         self.main_layout.addWidget(self.row2_container)
 
         # 固定宽度450像素
@@ -455,13 +472,29 @@ class MainWindow(QWidget):
                 continue
             self.add_index_to_layout(code, self.row1_layout)
 
+        self.breadth_container = QWidget()
+        self.breadth_container.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        breadth_layout = QHBoxLayout(self.breadth_container)
+        breadth_layout.setContentsMargins(0, 0, 0, 0)
+        breadth_layout.setSpacing(4)
+        self.breadth_up = QLabel("Z--")
+        self.breadth_down = QLabel("D--")
+        for label in (self.breadth_up, self.breadth_down):
+            label.setFont(self.font_volume)
+            label.setStyleSheet("color: #6b7280;")
+            label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            breadth_layout.addWidget(label)
+        self.row1_layout.addWidget(self.breadth_container)
+        self.row1_layout.addStretch()
+        self.render_breadth()
+
         # 第二行的三个指标包在一个固定宽度的容器里
         indices_container = QWidget()
         indices_container.setStyleSheet("background: transparent; border: none;")
         indices_container.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         indices_layout = QHBoxLayout(indices_container)
         indices_layout.setContentsMargins(0, 0, 0, 0)
-        indices_layout.setSpacing(16)
+        indices_layout.setSpacing(8)
 
         # 剩余放第二行的内层容器
         for code in indices[3:]:
@@ -470,7 +503,6 @@ class MainWindow(QWidget):
             self.add_index_to_layout(code, indices_layout)
 
         self.row2_layout.addWidget(indices_container)
-        self.row2_layout.addStretch()
         vol_container = QWidget()
         self.volume_container = vol_container
         vol_container.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
@@ -505,6 +537,7 @@ class MainWindow(QWidget):
         vol_inner.addWidget(self.status_label)
 
         self.row2_layout.addWidget(vol_container)
+        self.row2_layout.addStretch()
 
     def add_index_to_layout(self, code, layout):
         """添加一个指数（3个标签包在一个容器里）"""
@@ -668,6 +701,8 @@ class MainWindow(QWidget):
         self.fetcher = DataFetcher(self.config.get('indices', []))
         self.fetcher.data_ready.connect(self.update_display)
         self.fetcher.error_occurred.connect(self.handle_error)
+        self.fetcher.breadth_ready.connect(self.update_breadth)
+        self.fetcher.breadth_error_occurred.connect(self.handle_breadth_error)
         self.fetcher.finished.connect(self.finish_quit)
         self.fetcher.start()
 
@@ -694,6 +729,33 @@ class MainWindow(QWidget):
         self.comparison = None
         self.comparison_error = message
         self.render_turnover()
+
+    def update_breadth(self, breadth):
+        self.breadth = breadth
+        self.breadth_error = ""
+        self.render_breadth()
+        self.fit_content_width()
+
+    def handle_breadth_error(self, message):
+        self.breadth = None
+        self.breadth_error = message
+        self.render_breadth()
+
+    def render_breadth(self):
+        tooltip = ["沪深 A 股涨跌家数（不含北交所、B 股）", "Z：上涨家数；D：下跌家数"]
+        if self.breadth is not None:
+            self.breadth_up.setText(f"Z{self.breadth.advancing}")
+            self.breadth_down.setText(f"D{self.breadth.declining}")
+            tooltip.extend([
+                f"上涨 {self.breadth.advancing} 家，下跌 {self.breadth.declining} 家",
+                "行情时间：" + self.breadth.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            ])
+        else:
+            self.breadth_up.setText("Z--")
+            self.breadth_down.setText("D--")
+            tooltip.append("暂不可用：" + self.breadth_error)
+        tooltip.extend(["平盘和停牌不计入涨跌家数", "数据来源：东方财富；随行情刷新"])
+        self.breadth_container.setToolTip("\n".join(tooltip))
 
     def update_display(self, data):
         """更新显示"""
@@ -755,9 +817,13 @@ class MainWindow(QWidget):
             tooltip.append("较昨同刻暂不可用：" + (self.comparison_error or "等待同一交易日完整数据"))
         tooltip.append(f"差额每 {self.config['turnover_compare_minutes']} 分钟更新，使用已完成分钟")
         self.volume_container.setToolTip("\n".join(tooltip))
-        # 保留两行布局，成交额变长时扩展窗口，避免金额或指数被截断。
+        self.fit_content_width()
+
+    def fit_content_width(self):
+        # 按当前内容调整宽度，紧凑显示时回落到原有的450像素。
+        self.ensurePolished()
         self.main_layout.invalidate()
-        width = max(450, self.main_layout.sizeHint().width(), self.width())
+        width = max(450, self.main_layout.sizeHint().width())
         self.setFixedWidth(width)
 
     def handle_error(self, error_msg):
